@@ -1,7 +1,8 @@
 # figma-comments-mcp
 
-**An MCP server that lets Claude read your Figma comments and Dev Mode annotations.**
-Read-only. Scoped to the frame you link.
+**An MCP server that lets Claude read your Figma comments and Dev Mode annotations, and delete
+threads once they're handled.** Reads are scoped to the frame you link. The one write deletes a
+single comment thread, and a read-only token keeps it switched off.
 
 Design feedback lives in Figma. The agent can't see it. So every round of changes meant
 reading comments in Figma, retyping them into Claude, and pasting the result back — with me
@@ -25,14 +26,20 @@ so the agent knows what the feedback is about:
 rNK3UkoeLnbBHHYQiv9MW8 · frame 132:5 "01 · Results — default" · 1 thread · 1 annotation
 
 1873426532 · Eun Ji Jung · 2026-08-05 19:22
-  on 132:5 "01 · Results — default" FRAME
+  on 132:5 "01 · Results — default" FRAME → 132:301 "Export" TEXT "Export" in "Toolbar" at 640,18
   have hover states
 
 annotation on 132:258 "Overview" FRAME
   allow for collapsing panels
 ```
 
-## The two tools
+A pin on a big frame doesn't stop at the frame. After the `→` comes the deepest visible layer
+under the pin, its text if it has any, the nearest named layer around it, and the pin's
+position within the frame. A box dragged over an area is tagged `[area]`, resolves to the
+deepest layer holding the whole box, and prints its size after its position. If the pin sits
+on the frame itself, the line ends with just the position.
+
+## The three tools
 
 **`list_figma_comments`** — comment threads and Dev Mode annotations on a file, or on one
 frame within it, each resolved to its layer.
@@ -41,10 +48,26 @@ frame within it, each resolved to its layer.
 is spatial (*"too much space here"*) and the words alone don't carry it, or when it's pinned
 to a pasted screenshot whose layer name is something useless like `image 21`.
 
-### It only reads
+**`delete_figma_comment`** — permanently deletes one comment thread you've finished with. Needs
+a token with write access for comments.
 
-It never writes to Figma, edits your designs, or posts replies. The token it asks for is
-read-only on both scopes, and there is no code path that mutates anything.
+### The one thing it can change
+
+`delete_figma_comment` is the only write. Everything else only reads, and nothing here edits
+your designs, posts replies, or resolves threads.
+
+Deleting can't be undone, so the tool is careful about it:
+
+- You pass the number of replies the thread had when you handled it. It reads the thread first
+  and deletes nothing if the comment is gone or the count has changed, printing the thread as it
+  stands so a new reply gets read instead of lost.
+- A small gap remains: Figma has no conditional delete, so a reply landing between that read and
+  the delete can't be caught.
+- It takes one root comment per call. There is no bulk mode, and a reply id is refused.
+- A successful delete returns the whole thread, with authors and dates. That output is the only
+  record, so keep it if it matters.
+- Figma only lets a comment's author delete it. Its docs don't say what happens to replies when
+  a root comment goes, so treat them as gone.
 
 ### Two behaviours worth knowing
 
@@ -83,12 +106,17 @@ The client runs `dist/`, not `src/`, so the build isn't optional.
 Figma → your avatar → **Settings** → **Security** → **Personal access tokens** → *Generate
 new token*.
 
-You need **two** scopes, both read-only:
+Choose your scopes by what you want the server to do:
 
-| Scope | Set to |
-|---|---|
-| **File content** | Read-only |
-| **Comments** | Read-only |
+| Scope | To read | To also delete threads |
+|---|---|---|
+| **File content** (`file_content:read`) | Read-only | Read-only |
+| **Comments** (`file_comments:read`, `file_comments:write`) | Read-only | Read and write |
+
+Deleting needs both comment scopes, because the tool reads the thread before it deletes.
+Figma's docs don't say whether write access includes read, so if you're offered them separately,
+choose both. With a read-only token, reading works as normal and `delete_figma_comment` returns
+a 403 that says what's missing. To add write access later, generate a new token and swap it in.
 
 File content alone is the easy mistake — the server starts fine, resolves layer names fine,
 then returns a 403 the moment it asks for comments.
@@ -159,6 +187,7 @@ reviewer left it into the change, without passing through you.
 |---|---|
 | `403` on every call | Token is missing the **Comments** scope, or it expired. File content alone isn't enough. |
 | `403` on some calls only | Token works, but the account can't see this file. Check you can open it in the browser as the same user. |
+| `403` on `delete_figma_comment` only | The token has no write access for comments, or the comment isn't yours. Only a comment's author can delete it. |
 | `404` on a file that exists | Wrong file key, or the file belongs to an org the token's account isn't in. |
 | `429` | Figma rate limit. Wait and retry. |
 | `FIGMA_TOKEN is not set` | The client isn't passing the env var — it goes in the server's `env` block, not your shell. |
@@ -174,8 +203,8 @@ reviewer left it into the change, without passing through you.
   `fetch` — no SDK.
 - Auth is the `X-Figma-Token` header. `figd_` tokens reject `Authorization: Bearer`, which is
   the first thing to check on a 401 or 403.
-- Read-only endpoints used: `/v1/files/:key/comments`, `/v1/files/:key/nodes`,
-  `/v1/files/:key`, `/v1/images/:key`.
+- Endpoints used: `GET /v1/files/:key/comments`, `/v1/files/:key/nodes`, `/v1/files/:key` and
+  `/v1/images/:key`, plus `DELETE /v1/files/:key/comments/:id` for the one write.
 - Built with Claude.
 
 ## Related

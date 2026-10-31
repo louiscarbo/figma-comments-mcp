@@ -62,7 +62,7 @@ function explain(status: number, body: string): string {
 
 const FIGMA_TOKEN = process.env.FIGMA_TOKEN;
 
-export async function figmaFetch<T>(path: string, init?: RequestInit): Promise<T> {
+async function figmaRequest(path: string, init?: RequestInit): Promise<Response> {
   const res = await fetch(`${FIGMA_API_BASE}${path}`, {
     ...init,
     headers: {
@@ -74,7 +74,51 @@ export async function figmaFetch<T>(path: string, init?: RequestInit): Promise<T
   if (!res.ok) {
     throw new FigmaError(res.status, await res.text());
   }
+  return res;
+}
+
+export async function figmaFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await figmaRequest(path, init);
   return (await res.json()) as T;
+}
+
+/**
+ * Success is the status alone. Figma's docs say this returns nothing and its
+ * OpenAPI spec says it returns JSON, and parsing the wrong guess would report a
+ * delete that happened as a failure, losing the only record of the thread.
+ */
+export async function deleteComment(fileKey: string, commentId: string): Promise<void> {
+  await figmaRequest(
+    `/files/${encodeURIComponent(fileKey)}/comments/${encodeURIComponent(commentId)}`,
+    { method: 'DELETE' }
+  );
+}
+
+const WRITE_ACCESS_FIX =
+  'Generate a new Figma personal access token (Settings → Security) with File content read-only and Comments read and write, store it in place of the old one, then reconnect this server.';
+
+/**
+ * Why a delete failed, and whether the thread is still there. A 4xx is a clean
+ * refusal. A 5xx or a dropped connection may have landed first, so those say so.
+ *
+ * Figma doesn't document the 403 for a missing scope, and only a comment's author
+ * may delete it, so a 403 that doesn't mention scopes has to name both causes.
+ */
+export function deleteFailure(err: unknown, author: string): string {
+  if (err instanceof FigmaError && err.status === 403) {
+    return /scope/i.test(err.body)
+      ? `Nothing was deleted: this Figma token needs write access for comments (file_comments:write). ${WRITE_ACCESS_FIX}`
+      : `Nothing was deleted: Figma refused it (403). Either this comment isn't yours, since only its author (${author}) can delete it, or the token needs write access for comments (file_comments:write). ${WRITE_ACCESS_FIX}`;
+  }
+  if (err instanceof FigmaError && err.status === 404) {
+    return 'Figma has no such comment any more (404). It was there a moment ago, so it was probably deleted in the meantime.';
+  }
+  if (err instanceof FigmaError && err.status < 500) {
+    return `Nothing was deleted. ${err.message}`;
+  }
+
+  const reason = err instanceof Error ? err.message : String(err);
+  return `The delete may or may not have gone through. Run list_figma_comments before retrying, and keep this text in case it did. ${reason}`;
 }
 
 /**
@@ -123,10 +167,17 @@ export function parseNodeId(input: string): string | null {
   return normalizeNodeId(decodeURIComponent(match[1]));
 }
 
-interface NodeDoc {
+export type Box = { x: number; y: number; width: number; height: number };
+
+export interface NodeDoc {
   id: string;
   name: string;
   type: string;
+  visible?: boolean;
+  clipsContent?: boolean;
+  itemReverseZIndex?: boolean;
+  characters?: string;
+  absoluteBoundingBox?: Box | null;
   annotations?: FigmaAnnotation[];
   children?: NodeDoc[];
 }
@@ -205,7 +256,7 @@ export async function descendantNodes(
   }
 
   const walk = (node: NodeDoc) => {
-    names.set(node.id, { name: node.name, type: node.type });
+    names.set(node.id, { name: node.name, type: node.type, doc: node });
     node.children?.forEach(walk);
   };
   walk(root);
@@ -242,11 +293,125 @@ export function pinNodeId(pin: CommentPin | null): string | null {
 export interface NodeInfo {
   name: string;
   type: string;
+  doc: NodeDoc;
+}
+
+/**
+ * The area a pin covers, relative to the pinned node's top-left. A plain pin is
+ * a zero-size box.
+ *
+ * For a region, node_offset is the anchor and comment_pin_corner says which
+ * corner of the box the anchor is. Figma defaults that to bottom-right, so the
+ * offset is usually the far corner of the box, not its origin.
+ */
+export function pinBox(pin: NodePin): Box {
+  const width = pin.region_width ?? 0;
+  const height = pin.region_height ?? 0;
+  const corner = pin.comment_pin_corner ?? 'bottom-right';
+  return {
+    x: pin.node_offset.x - (corner.endsWith('right') ? width : 0),
+    y: pin.node_offset.y - (corner.startsWith('bottom') ? height : 0),
+    width,
+    height
+  };
+}
+
+function encloses(outer: Box, inner: Box): boolean {
+  return (
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.width <= outer.x + outer.width &&
+    inner.y + inner.height <= outer.y + outer.height
+  );
+}
+
+/**
+ * `node` down to the deepest visible layer enclosing `box`, or null if there is
+ * none. Children stack back to front, so the last one is tried first: where
+ * layers overlap, the one on top is the one the author was looking at.
+ *
+ * An unclipped frame's children can overflow it, so missing the frame only rules
+ * out its subtree when it clips.
+ */
+function trailTo(node: NodeDoc, box: Box): NodeDoc[] | null {
+  if (node.visible === false) return null;
+
+  const bounds = node.absoluteBoundingBox;
+  const inside = !!bounds && encloses(bounds, box);
+  if (!inside && node.clipsContent) return null;
+
+  const children = node.children ?? [];
+  const topFirst = node.itemReverseZIndex ? children : [...children].reverse();
+  for (const child of topFirst) {
+    const trail = trailTo(child, box);
+    if (trail) return [node, ...trail];
+  }
+  return inside ? [node] : null;
+}
+
+/**
+ * The layers from `root`, the pinned node, down to the one the pin sits on: the
+ * deepest visible layer holding the whole pin. Just `[root]` when no child does.
+ * Null when `root` has no bounds to measure from, as a page doesn't.
+ */
+export function pinTrail(root: NodeDoc, pin: NodePin): NodeDoc[] | null {
+  const origin = root.absoluteBoundingBox;
+  if (!origin) return null;
+
+  const box = pinBox(pin);
+  return trailTo(root, { ...box, x: origin.x + box.x, y: origin.y + box.y }) ?? [root];
+}
+
+/** Names Figma gives containers by default, which say nothing about the layer. */
+const DEFAULT_CONTAINER_NAME = /^(frame|group|section|component|union|subtract|intersect|exclude)( \d+)?$/i;
+
+const MAX_TEXT_PREVIEW = 60;
+
+function textPreview(characters: string): string {
+  const flat = characters.replace(/\s+/g, ' ').trim();
+  return flat.length > MAX_TEXT_PREVIEW ? `${flat.slice(0, MAX_TEXT_PREVIEW)}…` : flat;
+}
+
+/**
+ * What a pin sits on, for the end of the "on <frame>" line:
+ * `→ 508:7009 "End" TEXT "End" in "Session card" at 1626,6352`
+ *
+ * The position is relative to the pinned node, so it doesn't depend on where the
+ * frame sits on the canvas. A region prints its top-left, then its size.
+ *
+ * Empty when there is nothing to measure, which leaves the line as it was.
+ */
+export function describePin(root: NodeDoc, pin: CommentPin | null): string {
+  if (!pin || !('node_offset' in pin) || !pin.node_offset) return '';
+
+  const trail = pinTrail(root, pin);
+  if (!trail) return '';
+
+  const layer = trail[trail.length - 1];
+  const ancestor = trail
+    .slice(1, -1)
+    .reverse()
+    .find((node) => !DEFAULT_CONTAINER_NAME.test(node.name));
+  const box = pinBox(pin);
+  const text = layer.characters ? textPreview(layer.characters) : '';
+
+  return [
+    layer === root ? '' : `→ ${layer.id} "${layer.name}" ${layer.type}`,
+    text ? `"${text}"` : '',
+    ancestor ? `in "${ancestor.name}"` : '',
+    `at ${Math.round(box.x)},${Math.round(box.y)}`,
+    box.width || box.height ? `${Math.round(box.width)}×${Math.round(box.height)}` : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
  * Resolve node ids to human-readable layer names. This is what makes a pin
  * actionable — "on layer 'CTA button'" instead of "at {x: 40, y: 12}".
+ *
+ * Omitting depth returns each node's whole subtree, so what a pin sits on can be
+ * worked out from this response, with no further requests.
  *
  * Deliberately never throws: name resolution is an enrichment, and losing it
  * should degrade the output rather than fail the whole call.
@@ -265,12 +430,12 @@ export async function resolveNodeNames(
     const batch = unique.slice(i, i + BATCH);
     try {
       const data = await figmaFetch<{
-        nodes: Record<string, { document?: { id: string; name: string; type: string } } | null>;
+        nodes: Record<string, { document?: NodeDoc } | null>;
       }>(`/files/${fileKey}/nodes?ids=${encodeURIComponent(batch.join(','))}`);
 
       for (const [id, entry] of Object.entries(data.nodes ?? {})) {
         const doc = entry?.document;
-        if (doc) out.set(id, { name: doc.name, type: doc.type });
+        if (doc) out.set(id, { name: doc.name, type: doc.type, doc });
       }
     } catch {
       // Enrichment only — leave these ids unresolved.

@@ -1,10 +1,11 @@
 {
   "name": "figma-comments-mcp",
   "version": "2.1.0",
-  "description": "An MCP server that lets Claude read Figma file comments directly, scoped to the frame you linked.",
+  "description": "An MCP server that lets Claude read Figma file comments directly, scoped to the frame you linked, and delete threads once they're handled.",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "test": "tsc && node --test test/pin.test.mjs test/delete.test.mjs",
     "start": "node dist/index.js",
     "try": "node scripts/try.mjs"
   },

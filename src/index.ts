@@ -2,10 +2,13 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 import {
+  deleteComment,
+  deleteFailure,
   figmaFetch,
   parseFileKey,
   parseNodeId,
   descendantNodes,
+  describePin,
   fileAnnotations,
   pinNodeId,
   normalizeNodeId,
@@ -35,6 +38,10 @@ function text(body: string) {
   return { content: [{ type: 'text' as const, text: body }] };
 }
 
+function refusal(body: string) {
+  return { ...text(body), isError: true };
+}
+
 async function fetchComments(fileKey: string): Promise<FigmaComment[]> {
   const data = await figmaFetch<{ comments: FigmaComment[] }>(`/files/${fileKey}/comments`);
   return data.comments ?? [];
@@ -43,6 +50,26 @@ async function fetchComments(fileKey: string): Promise<FigmaComment[]> {
 /** "2026-08-05T15:36:10.517Z" → "2026-08-05 15:36". Seconds never mattered. */
 function shortTime(iso: string): string {
   return iso.replace('T', ' ').slice(0, 16);
+}
+
+function oldestFirst(a: FigmaComment, b: FigmaComment): number {
+  return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+}
+
+/**
+ * A thread in full. Unlike the list output this keeps line breaks and dates on
+ * replies, because after a delete this text is the only record.
+ */
+function threadRecord(root: FigmaComment, replies: FigmaComment[]): string {
+  const lines = [
+    `${root.id} · ${root.user.handle} · ${shortTime(root.created_at)}`,
+    `  ${root.message.replace(/\n/g, '\n  ')}`
+  ];
+  for (const reply of replies) {
+    lines.push(`  ↳ ${reply.id} · ${reply.user.handle} · ${shortTime(reply.created_at)}`);
+    lines.push(`    ${reply.message.replace(/\n/g, '\n    ')}`);
+  }
+  return lines.join('\n');
 }
 
 /** How many notes a set of annotated nodes carries — a node can hold several. */
@@ -168,7 +195,7 @@ server.registerTool(
       }
       if (!include_annotations) annotations = [];
 
-      threads.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      threads.sort(oldestFirst);
 
       const scopeLabel = scopeId
         ? `${names.get(scopeId)?.type.toLowerCase() ?? 'node'} ${scopeId} "${names.get(scopeId)?.name ?? '?'}"`
@@ -205,9 +232,10 @@ server.registerTool(
 
         if (nodeId) {
           // A dragged region means "everything in this box", not "this spot".
-          // Which it is changes the reading; the pixel figures never did.
           const area = pin && 'region_width' in pin && pin.region_width ? ' [area]' : '';
-          lines.push(`  on ${nodeId} "${info?.name ?? '?'}" ${info?.type ?? '?'}${area}`);
+          const pinned = `  on ${nodeId} "${info?.name ?? '?'}" ${info?.type ?? '?'}${area}`;
+          const layer = info ? describePin(info.doc, pin) : '';
+          lines.push(layer ? `${pinned} ${layer}` : pinned);
 
           // Layer names go generic exactly where they matter most — a comment
           // on a pasted screenshot resolves to "image 21".
@@ -220,9 +248,7 @@ server.registerTool(
 
         lines.push(`  ${root.message.replace(/\n+/g, ' ')}`);
 
-        for (const r of (repliesByParent.get(root.id) ?? []).sort(
-          (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-        )) {
+        for (const r of (repliesByParent.get(root.id) ?? []).sort(oldestFirst)) {
           lines.push(`  ↳ ${r.user.handle}: ${r.message.replace(/\n+/g, ' ')}`);
         }
       }
@@ -304,6 +330,73 @@ server.registerTool(
           { type: 'image' as const, data: render.data, mimeType: render.mimeType }
         ]
       };
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.registerTool(
+  'delete_figma_comment',
+  {
+    title: 'Delete a handled Figma comment thread',
+    description:
+      'Permanently delete one comment thread you have finished handling. This cannot be undone, and only the comment\'s author can do it. The reply count is a guard: if the thread no longer has expected_reply_count replies, nothing is deleted and the thread is printed as it stands, so a reply added since you read it is seen rather than destroyed. On success, returns the full text of what was deleted, which is the only record.',
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    inputSchema: z.object({
+      file: z.string().describe('A Figma file URL or a bare file key'),
+      comment_id: z
+        .string()
+        .describe(
+          'The root comment of the thread, as printed by list_figma_comments. One thread per call; a reply id is refused.'
+        ),
+      expected_reply_count: z
+        .number()
+        .int()
+        .min(0)
+        .describe(
+          'How many replies the thread had when you handled it: the ↳ lines in list_figma_comments, 0 if none. Report what you saw, and never fill this in from a refusal without reading the thread again.'
+        )
+    })
+  },
+  async ({ file, comment_id, expected_reply_count }) => {
+    try {
+      const fileKey = parseFileKey(file);
+      const comments = await fetchComments(fileKey);
+
+      const target = comments.find((c) => c.id === comment_id);
+      if (!target) {
+        return refusal(
+          `Nothing was deleted: no comment with id "${comment_id}" on this file. Run list_figma_comments to get current ids.`
+        );
+      }
+
+      const rootId = target.parent_id || target.id;
+      const root = comments.find((c) => c.id === rootId) ?? target;
+      const replies = comments.filter((c) => c.parent_id === rootId).sort(oldestFirst);
+      const record = threadRecord(root, replies);
+
+      if (target.parent_id) {
+        return refusal(
+          `Nothing was deleted: ${comment_id} is a reply, and this tool deletes whole threads. The thread's root is ${rootId}.\n\n${record}`
+        );
+      }
+
+      if (replies.length !== expected_reply_count) {
+        return refusal(
+          `Nothing was deleted: this thread has ${replies.length} ${replies.length === 1 ? 'reply' : 'replies'}, not the ${expected_reply_count} you expected. Read it as it stands now and handle anything new before deleting it.\n\n${record}`
+        );
+      }
+
+      try {
+        await deleteComment(fileKey, target.id);
+      } catch (err) {
+        return refusal(`${deleteFailure(err, target.user.handle)}\n\n${record}`);
+      }
+
+      return text(
+        `Deleted comment ${target.id} from ${fileKey}. This can't be undone, and Figma doesn't document what happens to replies, so treat them as gone. This is the only record:\n\n${record}`
+      );
     } catch (err) {
       return toolError(err);
     }
